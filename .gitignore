@@ -1,4 +1,12 @@
 venv/
-reports/
 .vscode/
 .pytest_cache/
+__pycache__/
+
+# Bỏ qua các file báo cáo HTML (vẫn push code .py trong thư mục reports)
+reports/*.html
+
+# Bỏ qua tất cả các file tạm của Excel (chứa ký tự ~$)
+~$*.xlsx
+~$*.xls
+~$*
