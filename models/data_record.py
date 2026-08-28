@@ -6,9 +6,9 @@ class DataRecord(BaseModel):
     data: Dict[str, Any] = Field(default_factory=dict)
 
     def get_value(self, column_name: str) -> Any:
-        """Lấy giá trị của một cột trong dòng dữ liệu"""
+        """Get the value of a column in the data row."""
         return self.data.get(column_name)
 
     def set_value(self, column_name: str, value: Any) -> None:
-        """Gán giá trị cho một cột trong dòng dữ liệu"""
+        """Set the value of a column in the data row."""
         self.data[column_name] = value

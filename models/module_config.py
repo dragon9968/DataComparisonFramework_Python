@@ -8,7 +8,7 @@ class ModuleConfig(BaseModel):
 
     module_name: str = Field(validation_alias=AliasChoices("moduleName", "module_name"))
     
-    # Lấy mặc định từ GlobalConstants thay vì viết cứng chuỗi chữ
+    # Use defaults from GlobalConstants instead of hard-coded strings
     source_file: str = Field(
         default=GlobalConstants.DEFAULT_SOURCE_FILE, 
         validation_alias=AliasChoices("sourceFile", "source_file")
@@ -25,7 +25,7 @@ class ModuleConfig(BaseModel):
     compare_columns: List[str] = Field(default=[], validation_alias=AliasChoices("compareColumns", "compare_columns"))
     mappings: List[ColumnMapping] = Field(default=[], validation_alias=AliasChoices("mappings", "columnMappings", "column_mappings"))
 
-    # ➕ Bổ sung nạp valueMappings từ JSON
+    # ➕ Load valueMappings from JSON
     value_mappings: Dict[str, Dict[str, str]] = Field(
         default={}, 
         validation_alias=AliasChoices("valueMappings", "value_mappings")

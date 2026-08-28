@@ -3,10 +3,11 @@ venv/
 .pytest_cache/
 __pycache__/
 
-# Bỏ qua các file báo cáo HTML (vẫn push code .py trong thư mục reports)
+# Ignore HTML report files (while still committing .py files in reports)
 reports/*.html
-
-# Bỏ qua tất cả các file tạm của Excel (chứa ký tự ~$)
+test-output/*
+# Ignore all temporary Excel files (containing ~$)
 ~$*.xlsx
+~$*.xlsm
 ~$*.xls
 ~$*

@@ -1,108 +1,157 @@
-import polars as pl
+import re
+from datetime import datetime
 from models.module_config import ModuleConfig
 
 class DataComparator:
 
     @staticmethod
-    def _clean_numeric_string(val_str: str) -> str:
-        """Bỏ dấu phẩy phân cách hàng ngàn và chuẩn hóa số thập phân khuyết số 0"""
-        v = val_str.replace(",", "").strip()
-        if v.startswith("."):
-            v = "0" + v
-        elif v.startswith("-."):
-            v = "-0" + v[1:]
-        return v
+    def is_leading_zero_code(val_str: str) -> bool:
+        """Check if value is a code with leading zeros (e.g. '0001', '0100')."""
+        return bool(re.match(r"^0[0-9]{2,}.*", val_str)) and "." not in val_str
+
+    @staticmethod
+    def _clean_cell_value(val) -> str:
+        """Format cell value cleanly to string without trailing float zeros or midnight time parts."""
+        if val is None:
+            return ""
+        s = str(val).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        if s.endswith(" 00:00:00"):
+            s = s[:-9]
+        elif s.endswith("T00:00:00"):
+            s = s[:-9]
+        return s
 
     @classmethod
-    def is_equal_values(cls, s_val: str, t_val: str) -> bool:
-        """Hàm so sánh thông minh tương tự Java (hỗ trợ cả chữ lẫn số)"""
-        # 1. Khớp hoàn toàn hoặc khớp chuỗi không phân biệt hoa thường
-        if s_val.lower() == t_val.lower():
+    def is_value_matching(cls, value_mappings: dict, full_col_name: str, exp_val: str, act_val: str) -> bool:
+        """Perform Java-equivalent smart matching for text, dates, numbers, and value mappings."""
+        exp_clean = cls._clean_cell_value(exp_val)
+        act_clean = cls._clean_cell_value(act_val)
+
+        # 1. Exact case-insensitive match
+        if exp_clean.lower() == act_clean.lower():
             return True
 
-        # 2. Xử lý so sánh dạng Số (Bắt trọn 1,000.00 vs 1000 | 10.00 vs 10 | .00 vs 0)
-        try:
-            s_clean = cls._clean_numeric_string(s_val)
-            t_clean = cls._clean_numeric_string(t_val)
+        # 2. Smart Date / DateTime comparison
+        date_formats = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S")
+        for fmt_s in date_formats:
+            try:
+                dt_s = datetime.strptime(exp_clean, fmt_s)
+                for fmt_t in date_formats:
+                    try:
+                        dt_t = datetime.strptime(act_clean, fmt_t)
+                        if dt_s.date() == dt_t.date():
+                            return True
+                    except ValueError:
+                        pass
+            except ValueError:
+                pass
 
-            num_s = float(s_clean)
-            num_t = float(t_clean)
+        # 3. Numeric comparison (if not leading-zero code)
+        if not cls.is_leading_zero_code(exp_clean) and not cls.is_leading_zero_code(act_clean):
+            try:
+                d1 = float(exp_clean.replace(",", ""))
+                d2 = float(act_clean.replace(",", ""))
+                if abs(d1 - d2) < 1e-6:
+                    return True
+            except ValueError:
+                pass
 
-            # So sánh giá trị số thực tế (cho phép sai số siêu nhỏ 1e-6)
-            return abs(num_s - num_t) < 1e-6
-        except ValueError:
-            # Nếu không phải là số (chuỗi văn bản thường) -> Trả về False
-            return False
+        # 4. Value Mappings (Bidirectional lookup matching Java DataComparator)
+        col_rules = value_mappings.get(full_col_name, {})
+        if col_rules:
+            for rule_k, rule_v in col_rules.items():
+                k_str = str(rule_k).strip().lower()
+                v_str = str(rule_v).strip().lower()
+                if (exp_clean.lower() == k_str and act_clean.lower() == v_str) or \
+                   (exp_clean.lower() == v_str and act_clean.lower() == k_str):
+                    return True
+
+        return False
 
     @classmethod
-    def compare_data(cls, source_df: pl.DataFrame, target_df: pl.DataFrame, config: ModuleConfig) -> dict:
+    def compare_data_map(cls, expected_map: dict, actual_map: dict, config: ModuleConfig) -> dict:
+        """Reconcile expected_map against actual_map matching Java DataComparator logic."""
         results = {
             "status": "PASSED",
-            "total_source_rows": len(source_df),
-            "total_target_rows": len(target_df),
+            "total_source_rows": len(expected_map),
+            "total_target_rows": len(actual_map),
             "mismatches": []
         }
 
-        if len(source_df) != len(target_df):
+        if len(expected_map) != len(actual_map):
             results["status"] = "FAILED"
 
-        key_col = None
-        if config.key_columns:
-            key_col = config.key_columns if isinstance(config.key_columns, str) else config.key_columns[0]
+        compare_columns = config.compare_columns or [m.source_column for m in config.mappings]
+        value_mappings = config.value_mappings or {}
 
-        pairs_to_compare = []
-        if config.compare_columns:
-            for col in config.compare_columns:
-                pairs_to_compare.append((col, col))
-        elif config.mappings:
-            for m in config.mappings:
-                pairs_to_compare.append((m.source_column, m.target_column))
+        actual_key_case_map = {k.lower(): k for k in actual_map.keys()}
 
         count_no = 1
-        for src_col, tgt_col in pairs_to_compare:
-            if src_col not in source_df.columns or tgt_col not in target_df.columns:
+        valid_compare_columns = []
+
+        # STEP A: System-level missing column detection
+        for col_name in compare_columns:
+            has_source_data = any(
+                rec.get(col_name) is not None and str(rec.get(col_name)).strip() != ""
+                for rec in expected_map.values()
+            )
+            has_target_data = any(
+                rec.get(col_name) is not None and str(rec.get(col_name)).strip() != ""
+                for rec in actual_map.values()
+            )
+
+            is_missing_in_target = has_source_data and not has_target_data
+            is_missing_in_source = not has_source_data and has_target_data
+
+            if is_missing_in_target or is_missing_in_source:
                 results["status"] = "FAILED"
+                exp_msg = "Available in Source" if is_missing_in_target else "Missing in Source"
+                act_msg = "Missing in Target" if is_missing_in_target else "Available in Target"
                 results["mismatches"].append({
                     "no": count_no,
                     "key": "SYSTEM",
-                    "column": src_col,
-                    "expected": "Có trong Source" if src_col in source_df.columns else "Thiếu cột Source",
-                    "actual": "Có trong Target" if tgt_col in target_df.columns else "Thiếu cột Target",
+                    "column": col_name,
+                    "expected": exp_msg,
+                    "actual": act_msg,
                     "issue": "MISSING_COLUMN"
                 })
                 count_no += 1
-                continue
+            else:
+                valid_compare_columns.append(col_name)
 
-            col_value_map = config.value_mappings.get(src_col, {})
+        # STEP B: Record-by-record reconciliation loop
+        for key, exp_record in expected_map.items():
+            matched_act_key = actual_key_case_map.get(key.lower())
+            act_record = actual_map.get(matched_act_key) if matched_act_key else None
 
-            src_vals = source_df[src_col].to_list()
-            tgt_vals = target_df[tgt_col].to_list()
-            limit = min(len(src_vals), len(tgt_vals))
+            if act_record is None:
+                results["status"] = "FAILED"
+                results["mismatches"].append({
+                    "no": count_no,
+                    "key": key,
+                    "column": "ALL_FIELDS",
+                    "expected": "DATA AVAILABLE",
+                    "actual": "MISSING IN FILE EXTRACT",
+                    "issue": "MISSING RECORD"
+                })
+                count_no += 1
+            else:
+                for col_name in valid_compare_columns:
+                    exp_val = exp_record.get(col_name, "")
+                    act_val = act_record.get(col_name, "")
 
-            for idx in range(limit):
-                s_val = "" if src_vals[idx] is None else str(src_vals[idx]).strip()
-                t_val = "" if tgt_vals[idx] is None else str(tgt_vals[idx]).strip()
-
-                # Ánh xạ theo valueMappings nếu có
-                if col_value_map and s_val in col_value_map:
-                    s_val = col_value_map[s_val]
-
-                # 🚀 SO SÁNH THÔNG MINH (Bao trọn so sánh số & chuỗi)
-                if not cls.is_equal_values(s_val, t_val):
-                    results["status"] = "FAILED"
-                    
-                    key_val = f"Row {idx + 1}"
-                    if key_col and key_col in source_df.columns:
-                        key_val = str(source_df[key_col][idx])
-
-                    results["mismatches"].append({
-                        "no": count_no,
-                        "key": key_val,
-                        "column": src_col,
-                        "expected": s_val,
-                        "actual": t_val,
-                        "issue": "VARIANCE"
-                    })
-                    count_no += 1
+                    if not cls.is_value_matching(value_mappings, col_name, exp_val, act_val):
+                        results["status"] = "FAILED"
+                        results["mismatches"].append({
+                            "no": count_no,
+                            "key": key,
+                            "column": col_name,
+                            "expected": exp_val,
+                            "actual": act_val,
+                            "issue": "VARIANCE"
+                        })
+                        count_no += 1
 
         return results
