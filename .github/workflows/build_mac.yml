@@ -1,0 +1,43 @@
+name: Build macOS Executable
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build Executable with PyInstaller
+      run: |
+        pyinstaller --noconfirm --onedir --console --name "DataComparisonTool_Mac" --add-data "tests:tests" app_runner.py
+
+    - name: Prepare Delivery Package
+      run: |
+        mkdir -p dist/DataComparisonTool_Mac/resources/raw_data/main
+        mkdir -p dist/DataComparisonTool_Mac/resources/raw_data/hist
+        mkdir -p dist/DataComparisonTool_Mac/resources/sharetec_data/main
+        mkdir -p dist/DataComparisonTool_Mac/resources/sharetec_data/hist
+        cp pytest.ini dist/DataComparisonTool_Mac/ || true
+
+    - name: Upload Mac Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: DataComparisonTool_macOS
+        path: dist/DataComparisonTool_Mac/
