@@ -25,7 +25,7 @@ class DataComparator:
 
     @classmethod
     def is_value_matching(cls, value_mappings: dict, full_col_name: str, exp_val: str, act_val: str) -> bool:
-        """Perform Java-equivalent smart matching for text, dates, numbers, and value mappings."""
+        """Perform smart matching for text, dates, numbers, and value mappings."""
         exp_clean = cls._clean_cell_value(exp_val)
         act_clean = cls._clean_cell_value(act_val)
 
@@ -33,20 +33,31 @@ class DataComparator:
         if exp_clean.lower() == act_clean.lower():
             return True
 
-        # 2. Smart Date / DateTime comparison
-        date_formats = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S")
-        for fmt_s in date_formats:
+        # 2. Smart Date / DateTime comparison (expanded with 2-digit year formats like %y)
+        date_formats = (
+            "%Y-%m-%d", "%Y-%m-%d %H:%M:%S",
+            "%m/%d/%Y", "%d/%m/%Y",
+            "%m/%d/%y", "%d/%m/%y",
+            "%Y/%m/%d", "%y/%m/%d",
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        
+        exp_dt = None
+        for fmt in date_formats:
             try:
-                dt_s = datetime.strptime(exp_clean, fmt_s)
-                for fmt_t in date_formats:
-                    try:
-                        dt_t = datetime.strptime(act_clean, fmt_t)
-                        if dt_s.date() == dt_t.date():
-                            return True
-                    except ValueError:
-                        pass
+                exp_dt = datetime.strptime(exp_clean, fmt)
+                break
             except ValueError:
                 pass
+
+        if exp_dt:
+            for fmt in date_formats:
+                try:
+                    act_dt = datetime.strptime(act_clean, fmt)
+                    if exp_dt.date() == act_dt.date():
+                        return True
+                except ValueError:
+                    pass
 
         # 3. Numeric comparison (if not leading-zero code)
         if not cls.is_leading_zero_code(exp_clean) and not cls.is_leading_zero_code(act_clean):
@@ -58,7 +69,7 @@ class DataComparator:
             except ValueError:
                 pass
 
-        # 4. Value Mappings (Bidirectional lookup matching Java DataComparator)
+        # 4. Value Mappings (Bidirectional lookup)
         col_rules = value_mappings.get(full_col_name, {})
         if col_rules:
             for rule_k, rule_v in col_rules.items():
@@ -83,15 +94,21 @@ class DataComparator:
         if len(expected_map) != len(actual_map):
             results["status"] = "FAILED"
 
-        compare_columns = config.compare_columns or [m.source_column for m in config.mappings]
-        value_mappings = config.value_mappings or {}
+        # STEP A: Determine comparison columns
+        compare_columns = config.compare_columns
+        if not compare_columns and config.mappings:
+            compare_columns = [m.source_column for m in config.mappings]
+        if not compare_columns and expected_map:
+            first_record = next(iter(expected_map.values()), {})
+            compare_columns = list(first_record.keys())
 
+        value_mappings = config.value_mappings or {}
         actual_key_case_map = {k.lower(): k for k in actual_map.keys()}
 
         count_no = 1
         valid_compare_columns = []
 
-        # STEP A: System-level missing column detection
+        # STEP A1: System-level missing column detection
         for col_name in compare_columns:
             has_source_data = any(
                 rec.get(col_name) is not None and str(rec.get(col_name)).strip() != ""

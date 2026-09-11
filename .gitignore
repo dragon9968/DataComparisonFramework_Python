@@ -11,3 +11,12 @@ test-output/*
 ~$*.xlsm
 ~$*.xls
 ~$*
+build/*
+dist/*
+# Bỏ qua toàn bộ file dữ liệu bên trong (bao gồm cả thư mục con)
+resources/raw_data/**
+resources/sharetec_data/**
+
+# Giữ lại các file .gitkeep để Git nhận diện và giữ cấu trúc thư mục
+!resources/raw_data/**/.gitkeep
+!resources/sharetec_data/**/.gitkeep
