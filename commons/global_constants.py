@@ -6,8 +6,8 @@ class GlobalConstants:
     PROJECT_PATH = Path(__file__).parent.parent.resolve()
     
     # Define resource paths
-    CONFIG_PATH = os.path.join(PROJECT_PATH, "resources", "configs")
-    TEST_DATA_PATH = os.path.join(PROJECT_PATH, "resources", "test-data")
+    CONFIG_PATH = os.path.join(PROJECT_PATH, "resources", "raw_data")
+    TEST_DATA_PATH = os.path.join(PROJECT_PATH, "resources", "sharetec_data")
     OUTPUT_PATH = os.path.join(PROJECT_PATH, "test-output")
     REPORT_PATH = OUTPUT_PATH
 

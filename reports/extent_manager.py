@@ -2,18 +2,19 @@ import os
 import csv
 import html
 import re
+import time
 from datetime import datetime
 from commons.global_constants import GlobalConstants
 from utils.file_utils import FileUtils
 
 class ExtentManager:
     _test_results = []
-
+    _start_time = None
     @classmethod
     def clear_results(cls):
         """Clear previous test results before running a new test suite."""
         cls._test_results = []
-
+        cls._start_time = time.time()
     @classmethod
     def add_result(cls, module_name: str, status: str, total_exp: int, total_act: int, mismatches: list):
         cls._test_results.append({
@@ -54,7 +55,7 @@ class ExtentManager:
         csv_filename = f"{safe_module_name}_Discrepancies.csv"
         csv_path = os.path.join(GlobalConstants.OUTPUT_PATH, csv_filename)
         
-        headers = ["NO.", "KEY (MEMBER+TYPE)", "COLUMN NAME", "EXPECTED (DATA)", "ACTUAL (SHARETEC)", "ISSUES"]
+        headers = ["NO.", "KEY", "COLUMN NAME", "EXPECTED (DATA)", "ACTUAL (SHARETEC)", "ISSUES"]
         
         with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
@@ -73,8 +74,19 @@ class ExtentManager:
     @classmethod
     def generate_html_report(cls):
         FileUtils.create_directory_if_not_exists(str(GlobalConstants.OUTPUT_PATH))
+        cls.print_summary_table()
         report_file = os.path.join(GlobalConstants.OUTPUT_PATH, "ExtentDataReport.html")
         now_str = datetime.now().strftime("%b %d, %Y %I:%M:%S %p")
+        if cls._start_time:
+            elapsed_sec = time.time() - cls._start_time
+        else:
+            elapsed_sec = 0.0
+
+        if elapsed_sec < 60:
+            duration_str = f"{elapsed_sec:.2f}s"
+        else:
+            m, s = divmod(int(elapsed_sec), 60)
+            duration_str = f"{m}m {s}s"
 
         # Organize results by folder structure
         grouped_results = {}
@@ -186,6 +198,10 @@ class ExtentManager:
                     <div class="stat-title">FAILED</div>
                     <div class="stat-value" style="color:#dc3545;">{total_fail}</div>
                 </div>
+                <div class="card-stat" style="border-left: 4px solid #6f42c1;">
+                    <div class="stat-title">TOTAL DURATION</div>
+                    <div class="stat-value" style="color:#dc3545;">{duration_str}</div>
+                </div>
             </div>
 
             <p style="font-weight:bold; color:#333; margin-bottom:10px;">Overall File Verification Status:</p>
@@ -271,7 +287,7 @@ class ExtentManager:
                     <thead>
                         <tr>
                             <th style="width:50px; text-align:center;">NO.</th>
-                            <th style="width:150px;">KEY (MEMBER+TYPE)</th>
+                            <th style="width:150px;">KEY</th>
                             <th style="width:200px;">COLUMN NAME</th>
                             <th>EXPECTED (DATA)</th>
                             <th>ACTUAL (SHARETEC)</th>

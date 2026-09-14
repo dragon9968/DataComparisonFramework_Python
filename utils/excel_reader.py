@@ -1,58 +1,8 @@
 import os
-import re
 import polars as pl
 from models.module_config import ModuleConfig
 
 class ExcelReader:
-
-    @staticmethod
-    def _get_fast_evaluated_cell_value(val) -> str:
-        """Extract and clean cell value with leading zero decimal, date, and leading zero int formatting."""
-        if val is None:
-            return ""
-        s = str(val).strip()
-        if s.endswith(".0"):
-            s = s[:-2]
-        if s.endswith(" 00:00:00"):
-            s = s[:-9]
-        elif s.endswith("T00:00:00"):
-            s = s[:-9]
-        if s.startswith(".") and len(s) > 1 and s[1].isdigit():
-            s = "0" + s
-
-        # Normalize 2-digit year dates (e.g., 02/29/00 -> 2/29/2000, 06/30/05 -> 6/30/2005)
-        m_date2 = re.match(r"^0*(\d{1,2})[/-]0*(\d{1,2})[/-](\d{2})$", s)
-        if m_date2:
-            y = int(m_date2.group(3))
-            full_y = f"20{m_date2.group(3)}" if y < 50 else f"19{m_date2.group(3)}"
-            return f"{int(m_date2.group(1))}/{int(m_date2.group(2))}/{full_y}"
-
-        # Normalize 4-digit year dates (e.g., 04/21/2010 -> 4/21/2010)
-        m_date4 = re.match(r"^0*(\d{1,2})[/-]0*(\d{1,2})[/-](\d{4})$", s)
-        if m_date4:
-            return f"{int(m_date4.group(1))}/{int(m_date4.group(2))}/{m_date4.group(3)}"
-
-        # Normalize ISO dates (e.g., 2000-02-29 -> 2/29/2000)
-        m_iso = re.match(r"^(\d{4})[/-]0*(\d{1,2})[/-]0*(\d{1,2})$", s)
-        if m_iso:
-            return f"{int(m_iso.group(2))}/{int(m_iso.group(3))}/{m_iso.group(1)}"
-
-        # Normalize 2-digit leading zero integers (e.g., '01' -> '1', '09' -> '9', '00' -> '0')
-        if re.match(r"^0[0-9]$", s):
-            return str(int(s))
-
-        return s
-
-    @staticmethod
-    def _is_footer_metadata_row(val_str: str) -> bool:
-        """Check if cell value indicates the start of Progress/Sharetec metadata footer."""
-        if not val_str:
-            return False
-        s = val_str.strip().lower()
-        if s in [".", "psc", "0."]:
-            return True
-        metadata_prefixes = ("filename=", "records=", "ldbname=", "timestamp=", "numforma", "dateformat=", "cpstream=")
-        return any(s.startswith(p) for p in metadata_prefixes)
 
     @staticmethod
     def _detect_dynamic_key_columns(columns: list) -> list:
@@ -73,74 +23,111 @@ class ExcelReader:
         return detected if detected else [columns[0]]
 
     @classmethod
-    def read_file_to_map(cls, file_path: str, config: ModuleConfig, is_source: bool = True) -> dict:
+    def read_file_to_polars_df(cls, file_path: str, config: ModuleConfig, is_source: bool = True) -> pl.DataFrame:
+        """High-performance file reader with Rust-compatible regex normalization for both Source and Target."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"❌ Data file not found at: {file_path}")
 
         file_ext = os.path.splitext(file_path)[1].lower()
         sheet_name = config.expected_sheet_name if is_source else config.actual_sheet_name
 
-        if file_ext == ".csv":
-            df = pl.read_csv(file_path, infer_schema_length=0)
+        # 1. Read File supporting CSV, Excel, and Progress .d format
+        if file_ext in [".csv", ".d"]:
+            df = pl.read_csv(file_path, infer_schema_length=0, ignore_errors=True)
         elif file_ext in [".xlsx", ".xlsm", ".xls"]:
             df = pl.read_excel(file_path, sheet_name=sheet_name) if sheet_name else pl.read_excel(file_path)
+            df = df.select([pl.all().cast(pl.Utf8)])
         else:
             raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
 
         if df.height == 0:
-            return {}
+            return pl.DataFrame()
+
+        # 2. Metadata Truncation (Tail 50 rows)
+        first_col_raw = df.columns[0]
+        tail_size = min(50, df.height)
+        tail_df = df.tail(tail_size)
+        tail_clean = tail_df[first_col_raw].fill_null("").cast(pl.Utf8).str.replace_all(r'[\r\n\t\xa0"]', "").str.strip_chars().str.to_lowercase()
+
+        is_meta = (
+            tail_clean.is_in([".", "psc", "0."]) |
+            tail_clean.str.contains(r"^(filename=|records=|ldbname=|timestamp=|numforma|dateformat=|cpstream=)")
+        )
+        meta_indices = is_meta.arg_true()
+        if len(meta_indices) > 0:
+            cut_offset = (df.height - tail_size) + meta_indices[0]
+            df = df.slice(0, cut_offset)
+
+        if df.height == 0:
+            return pl.DataFrame()
 
         header_map = {col.strip().lower(): col for col in df.columns}
         actual_compare_cols = config.compare_columns if config.compare_columns else list(df.columns)
 
+        # 3. Vectorized Normalization
+        exprs = []
+        for col_name in actual_compare_cols:
+            actual_col = header_map.get(col_name.lower())
+            if actual_col:
+                expr = (
+                    pl.col(actual_col)
+                    .fill_null("")
+                    .cast(pl.Utf8)
+                    .str.replace_all(r'[\r\n\t\xa0"]', "")  # Strip quotes & control characters
+                    .str.strip_chars()                       # Strip leading/trailing spaces
+                    .str.replace(r"\.0$", "")                # Standardize float strings "1.0" -> "1"
+                    .str.replace(r" 00:00:00$", "")          # Strip time component
+                    .str.replace(r"T00:00:00$", "")
+                    .str.replace(r"^\.(\d+)", r"0.$1")
+                )
+
+                # Strip leading zeros cleanly for integers ("01"->"1", "00"->"0")
+                expr = expr.str.replace(r"^0+?([1-9]\d*|0)$", r"$1")
+
+                # Standardize Date Formats to M/D/YYYY:
+                expr = expr.str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
+                expr = expr.str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{2})$", r"$1/$2/20$3")
+                expr = expr.str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
+
+                exprs.append(expr.alias(col_name))
+            else:
+                exprs.append(pl.lit("").alias(col_name))
+
+        df_clean = df.select(exprs)
+
+        # 4. Composite Key Resolution (Conditional Indexing: Append (1) only if duplicate)
         key_columns_str = config.key_columns if isinstance(config.key_columns, str) else ",".join(config.key_columns or [])
         user_key_columns = [k.strip() for k in key_columns_str.split(",") if k.strip()]
-
-        records = df.to_dicts()
-        first_col_name = list(df.columns)[0]
 
         if not user_key_columns:
             effective_key_cols = cls._detect_dynamic_key_columns(list(df.columns))
         else:
             effective_key_cols = user_key_columns
 
-        result_map = {}
-        key_counter_map = {}
+        valid_keys = [k for k in effective_key_cols if k in df_clean.columns]
+        if valid_keys:
+            df_clean = df_clean.with_columns(
+                base_key=pl.concat_str([pl.col(k) for k in valid_keys], separator="_")
+            )
+        else:
+            df_clean = df_clean.with_columns(
+                base_key=pl.concat_str([pl.lit("ROW_"), pl.int_range(1, pl.len() + 1).cast(pl.Utf8)])
+            )
 
-        for idx, row in enumerate(records, start=1):
-            raw_first_val = str(row.get(first_col_name) or "").strip()
+        df_clean = df_clean.with_columns(
+            total_cnt=pl.col("base_key").count().over("base_key"),
+            occurrence=pl.col("base_key").cum_count().over("base_key")
+        ).with_columns(
+            final_key=pl.when(pl.col("total_cnt") == 1)
+            .then(pl.col("base_key"))
+            .otherwise(
+                pl.concat_str([
+                    pl.col("base_key"),
+                    pl.lit("("),
+                    pl.col("occurrence").cast(pl.Utf8),
+                    pl.lit(")")
+                ])
+            )
+        ).drop(["base_key", "total_cnt", "occurrence"])
 
-            if cls._is_footer_metadata_row(raw_first_val):
-                break
-
-            key_parts = []
-            for c in effective_key_cols:
-                col_actual_name = header_map.get(c.lower(), c)
-                val = cls._get_fast_evaluated_cell_value(row.get(col_actual_name))
-                if val != "":
-                    key_parts.append(val)
-
-            if not key_parts:
-                base_key = f"ROW_{idx}"
-            else:
-                base_key = "_".join(key_parts)
-
-            # Format key with 1-based sequence index in parentheses e.g. IC_DR(1), LA_OTH(2)
-            lower_base_key = base_key.lower()
-            occurrence = key_counter_map.get(lower_base_key, 0) + 1
-            key_counter_map[lower_base_key] = occurrence
-            final_key = f"{base_key}({occurrence})"
-
-            fields_map = {}
-            for col_name in actual_compare_cols:
-                actual_col = header_map.get(col_name.lower())
-                val = cls._get_fast_evaluated_cell_value(row.get(actual_col)) if actual_col else ""
-
-                if col_name.lower() in ["dp.dp-desc", "dp-desc", "description"] and len(val) > 25:
-                    val = val[:25].strip()
-
-                fields_map[col_name] = val
-
-            result_map[final_key] = fields_map
-
-        return result_map
+        return df_clean
