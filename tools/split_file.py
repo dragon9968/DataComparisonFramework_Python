@@ -66,7 +66,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", type=str, required=True)
     parser.add_argument("-o", "--output", type=str, required=False)
-    parser.add_argument("-c", "--chunk-size", type=int, default=150000)
+    parser.add_argument("-c", "--chunk-size", type=int)
     args = parser.parse_args()
 
     split_large_file(input_file=args.input, output_dir=args.output, chunk_size=args.chunk_size)

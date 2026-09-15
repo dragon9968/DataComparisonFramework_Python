@@ -16,7 +16,7 @@ class GlobalConstants:
     DEFAULT_TARGET_FILE = "data_extracted.xlsx"
 
     # Generic file splitting defaults (Dynamic usage)
-    DEFAULT_SPLIT_CHUNK_SIZE 200000  # Default 500k rows per chunk (~100MB - 150MB)
+    DEFAULT_SPLIT_CHUNK_SIZE = 200000  # Default 500k rows per chunk (~100MB - 150MB)
     DEFAULT_SPLIT_DIR_NAME = "split_chunks"  # Default subfolder name created dynamically
 
     @classmethod
