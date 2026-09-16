@@ -22,73 +22,44 @@ class ExcelReader:
 
         return detected if detected else [columns[0]]
 
-    @staticmethod
-    def _has_metadata_tail_fast(file_path: str) -> bool:
-        """Fast instant metadata check reading raw bytes from file tail without loading memory."""
-        try:
-            with open(file_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                file_size = f.tell()
-                read_size = min(file_size, 4096)
-                f.seek(file_size - read_size)
-                lines = f.read().decode("utf-8", errors="ignore").lower().splitlines()
-
-            for line in lines[-20:]:
-                clean_line = line.replace('"', '').strip()
-                if clean_line in [".", "psc", "0."] or any(
-                    clean_line.startswith(p) for p in [
-                        "filename=", "records=", "ldbname=", "timestamp=",
-                        "numforma", "dateformat=", "cpstream="
-                    ]
-                ):
-                    return True
-        except Exception:
-            pass
-        return False
-
     @classmethod
-    def read_file_to_polars_df(cls, file_path: str, config: ModuleConfig, is_source: bool = True) -> pl.DataFrame:
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"❌ Data file not found at: {file_path}")
+    def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig) -> pl.DataFrame:
+        """Normalize DataFrame batch with intelligent pivot-year date normalization."""
+        if df is None or df.height == 0:
+            return pl.DataFrame()
 
-        file_ext = os.path.splitext(file_path)[1].lower()
-        sheet_name = config.expected_sheet_name if is_source else config.actual_sheet_name
+        # 1. Truncate Metadata Trailer
+        first_col_raw = df.columns[0]
+        first_col_clean = (
+            df[first_col_raw]
+            .fill_null("")
+            .cast(pl.Utf8)
+            .str.replace_all(r'[\r\n\t\xa0"]', "")
+            .str.strip_chars()
+            .str.to_lowercase()
+        )
 
-        # 1. Fast Multi-threaded CSV Reader (Optimized for performance)
-        if file_ext in [".csv", ".d"]:
-            df = pl.read_csv(file_path, infer_schema_length=0, ignore_errors=True)
-        elif file_ext in [".xlsx", ".xlsm", ".xls"]:
-            df = pl.read_excel(file_path, sheet_name=sheet_name) if sheet_name else pl.read_excel(file_path)
-            df = df.select([pl.all().cast(pl.Utf8)])
-        else:
-            raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
+        is_meta = (
+            first_col_clean.is_in([".", "psc", "0."]) |
+            first_col_clean.str.contains(r"^(filename=|records=|ldbname=|timestamp=|numforma|dateformat=|cpstream=)")
+        )
+
+        tail_check_size = min(50, df.height)
+        tail_meta = is_meta.tail(tail_check_size)
+        meta_indices = tail_meta.arg_true()
+
+        if len(meta_indices) > 0:
+            cut_offset = (df.height - tail_check_size) + meta_indices[0]
+            df = df.slice(0, cut_offset)
 
         if df.height == 0:
             return pl.DataFrame()
 
-        # 2. Fast Metadata Truncation
-        if cls._has_metadata_tail_fast(file_path):
-            first_col_raw = df.columns[0]
-            tail_size = min(30, df.height)
-            tail_vals = df.slice(df.height - tail_size, tail_size)[first_col_raw].fill_null("").cast(pl.Utf8).str.replace_all(r'[\r\n\t\xa0"]', "").str.strip_chars().str.to_lowercase()
-            
-            is_meta = (
-                tail_vals.is_in([".", "psc", "0."]) |
-                tail_vals.str.contains(r"^(filename=|records=|ldbname=|timestamp=|numforma|dateformat=|cpstream=)")
-            )
-            meta_indices = is_meta.arg_true()
-            if len(meta_indices) > 0:
-                cut_offset = (df.height - tail_size) + meta_indices[0]
-                df = df.slice(0, cut_offset)
-
-        if df.height == 0:
-            return pl.DataFrame()
-
+        # 2. Vectorized Column Normalization
         header_map = {col.strip().lower(): col for col in df.columns}
         actual_compare_cols = config.compare_columns if config.compare_columns else list(df.columns)
         date_keywords = ("date", "dt", "time", "zz-", "day", "yr", "year", "mo", "month")
 
-        # 3. Targeted Vectorized Normalization
         exprs = []
         for col_name in actual_compare_cols:
             actual_col = header_map.get(col_name.lower())
@@ -111,7 +82,10 @@ class ExcelReader:
                         .str.replace(r" 00:00:00$", "")
                         .str.replace(r"T00:00:00$", "")
                         .str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
-                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{2})$", r"$1/$2/20$3")
+                        # 2-digit year 30-99 -> 19YY (e.g., 93 -> 1993, 35 -> 1935)
+                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([3-9]\d)$", r"$1/$2/19$3")
+                        # 2-digit year 00-29 -> 20YY (e.g., 24 -> 2024, 15 -> 2015)
+                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
                         .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
                     )
 
@@ -120,10 +94,8 @@ class ExcelReader:
                 exprs.append(pl.lit("").alias(col_name))
 
         df_clean = df.select(exprs)
-        del df
-        gc.collect()
 
-        # 4. Fast-Path Composite Key Resolution
+        # 3. Fast-Path Composite Key Resolution
         key_columns_str = config.key_columns if isinstance(config.key_columns, str) else ",".join(config.key_columns or [])
         user_key_columns = [k.strip() for k in key_columns_str.split(",") if k.strip()]
 
@@ -164,3 +136,21 @@ class ExcelReader:
             ).drop(["base_key", "total_cnt", "occurrence"])
 
         return df_clean
+
+    @classmethod
+    def read_file_to_polars_df(cls, file_path: str, config: ModuleConfig, is_source: bool = True) -> pl.DataFrame:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"❌ Data file not found at: {file_path}")
+
+        file_ext = os.path.splitext(file_path)[1].lower()
+        sheet_name = config.expected_sheet_name if is_source else config.actual_sheet_name
+
+        if file_ext in [".csv", ".d"]:
+            df = pl.read_csv(file_path, infer_schema_length=0, ignore_errors=True)
+        elif file_ext in [".xlsx", ".xlsm", ".xls"]:
+            df = pl.read_excel(file_path, sheet_name=sheet_name) if sheet_name else pl.read_excel(file_path)
+            df = df.select([pl.all().cast(pl.Utf8)])
+        else:
+            raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
+
+        return cls.normalize_dataframe_batch(df, config)

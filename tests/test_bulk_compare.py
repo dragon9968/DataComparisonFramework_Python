@@ -16,7 +16,6 @@ def get_all_bulk_files():
     file_list = []
     for root, _, files in os.walk(SOURCE_DIR):
         for file in files:
-            # Include .csv, .xlsx, .xls, .xlsm and .d data files
             if file.lower().endswith((".csv", ".xlsx", ".xls", ".xlsm", ".d")):
                 rel_path = os.path.relpath(os.path.join(root, file), SOURCE_DIR)
                 file_list.append(rel_path)
@@ -53,10 +52,16 @@ class TestBulkCompare:
             compareColumns=[]
         )
 
-        df_source = ExcelReader.read_file_to_polars_df(source_path, config, is_source=True)
-        df_target = ExcelReader.read_file_to_polars_df(target_path, config, is_source=False)
+        file_size_mb = os.path.getsize(source_path) / (1024 * 1024)
 
-        result = DataComparator.compare_polars_dfs(df_source, df_target, config)
+        # Trigger batch streaming & progress bar for files > 20MB
+        if file_size_mb > 20 and source_path.lower().endswith((".csv", ".d")):
+            result = DataComparator.compare_large_files_batched(source_path, target_path, config, batch_size=150000)
+        else:
+            df_source = ExcelReader.read_file_to_polars_df(source_path, config, is_source=True)
+            df_target = ExcelReader.read_file_to_polars_df(target_path, config, is_source=False)
+            result = DataComparator.compare_polars_dfs(df_source, df_target, config)
+
         total_discrepancies = len(result["mismatches"])
 
         ExtentManager.add_result(
