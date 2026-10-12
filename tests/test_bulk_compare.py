@@ -56,7 +56,7 @@ class TestBulkCompare:
 
         # Trigger batch streaming & progress bar for files > 20MB
         if file_size_mb > 20 and source_path.lower().endswith((".csv", ".d")):
-            result = DataComparator.compare_large_files_batched(source_path, target_path, config, batch_size=150000)
+            result = DataComparator.compare_large_files_batched(source_path, target_path, config, batch_size=200000)
         else:
             df_source = ExcelReader.read_file_to_polars_df(source_path, config, is_source=True)
             df_target = ExcelReader.read_file_to_polars_df(target_path, config, is_source=False)

@@ -11,7 +11,7 @@ class ExcelReader:
         exclude_keywords = ("zz-", "date", "amt", "bal", "amount", "balance", "desc")
 
         detected = []
-        leading_cols = columns[:min(4, len(columns))]
+        leading_cols = columns[:min(5, len(columns))]
 
         for col in leading_cols:
             col_lower = col.strip().lower()
@@ -20,15 +20,19 @@ class ExcelReader:
             if any(kw in col_lower for kw in key_keywords):
                 detected.append(col)
 
-        return detected if detected else [columns[0]]
+        if detected:
+            return detected
+
+        # Fallback to composite key using first 3 columns if no key keywords found
+        return columns[:min(3, len(columns))]
 
     @classmethod
     def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig) -> pl.DataFrame:
-        """Normalize DataFrame batch with intelligent pivot-year date normalization."""
+        """Normalize DataFrame batch with intelligent metadata trailer truncation."""
         if df is None or df.height == 0:
             return pl.DataFrame()
 
-        # 1. Truncate Metadata Trailer
+        # 1. Truncate Metadata Trailer (remove trailing metadata lines like ., PSC, filename=, records=, etc.)
         first_col_raw = df.columns[0]
         first_col_clean = (
             df[first_col_raw]
@@ -41,7 +45,9 @@ class ExcelReader:
 
         is_meta = (
             first_col_clean.is_in([".", "psc", "0."]) |
-            first_col_clean.str.contains(r"^(filename=|records=|ldbname=|timestamp=|numforma|dateformat=|cpstream=)")
+            first_col_clean.str.contains(
+                r"^(filename=|records=|ldbname=|timestamp=|numformat=|dateformat=|cpstream=|\.|\d{6,12}$)"
+            )
         )
 
         tail_check_size = min(50, df.height)
@@ -71,6 +77,7 @@ class ExcelReader:
                     .cast(pl.Utf8)
                     .str.replace_all(r'[\r\n\t\xa0"]', "")
                     .str.strip_chars()
+                    .str.replace(r"^\?$", "")  # Convert standalone '?' to blank string
                     .str.replace(r"\.0$", "")
                     .str.replace(r"^\.(\d+)", r"0.$1")
                     .str.replace(r"^0+?([1-9]\d*|0)$", r"$1")
@@ -82,9 +89,7 @@ class ExcelReader:
                         .str.replace(r" 00:00:00$", "")
                         .str.replace(r"T00:00:00$", "")
                         .str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
-                        # 2-digit year 30-99 -> 19YY (e.g., 93 -> 1993, 35 -> 1935)
                         .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([3-9]\d)$", r"$1/$2/19$3")
-                        # 2-digit year 00-29 -> 20YY (e.g., 24 -> 2024, 15 -> 2015)
                         .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
                         .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
                     )
@@ -146,7 +151,14 @@ class ExcelReader:
         sheet_name = config.expected_sheet_name if is_source else config.actual_sheet_name
 
         if file_ext in [".csv", ".d"]:
-            df = pl.read_csv(file_path, infer_schema_length=0, ignore_errors=True)
+            df = pl.read_csv(
+                file_path, 
+                infer_schema_length=0, 
+                ignore_errors=True, 
+                truncate_ragged_lines=True,
+                quote_char=None,
+                encoding="utf8-lossy"
+            )
         elif file_ext in [".xlsx", ".xlsm", ".xls"]:
             df = pl.read_excel(file_path, sheet_name=sheet_name) if sheet_name else pl.read_excel(file_path)
             df = df.select([pl.all().cast(pl.Utf8)])

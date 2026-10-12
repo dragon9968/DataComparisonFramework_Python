@@ -41,15 +41,12 @@ class DataComparator:
 
         mismatches = []
         mismatch_no = 1
-        MAX_MISMATCHES = 5000
 
         # Missing Records in Target
         missing_in_target = joined.filter(pl.col("final_key_target").is_null())
         if missing_in_target.height > 0:
             keys = missing_in_target.get_column("final_key").to_list()
             for k in keys:
-                if mismatch_no > MAX_MISMATCHES:
-                    break
                 mismatches.append({
                     "no": mismatch_no,
                     "key": k,
@@ -65,8 +62,6 @@ class DataComparator:
         if missing_in_source.height > 0:
             keys = missing_in_source.get_column("final_key_target").to_list()
             for k in keys:
-                if mismatch_no > MAX_MISMATCHES:
-                    break
                 mismatches.append({
                     "no": mismatch_no,
                     "key": k,
@@ -83,8 +78,6 @@ class DataComparator:
         if matched.height > 0:
             keys_series = matched["final_key"]
             for col in compare_cols:
-                if mismatch_no > MAX_MISMATCHES:
-                    break
                 target_col = f"{col}_target" if f"{col}_target" in matched.columns else col
 
                 s_exp = matched[col]
@@ -99,8 +92,7 @@ class DataComparator:
                     sub_exp = s_exp[diff_indices].to_list()
                     sub_act = s_act[diff_indices].to_list()
 
-                    limit = min(len(sub_keys), MAX_MISMATCHES - mismatch_no + 1)
-                    for i in range(limit):
+                    for i in range(len(sub_keys)):
                         mismatches.append({
                             "no": mismatch_no,
                             "key": sub_keys[i],
@@ -126,14 +118,30 @@ class DataComparator:
         print(f"\n🚀 [LARGE FILE MODE] Counting total rows in file for progress tracking...", flush=True)
         total_source_lines = cls._count_total_lines_fast(source_path)
         
-        reader_src = pl.read_csv_batched(source_path, batch_size=batch_size, infer_schema_length=0, ignore_errors=True)
-        reader_tgt = pl.read_csv_batched(target_path, batch_size=batch_size, infer_schema_length=0, ignore_errors=True)
+        reader_src = pl.read_csv_batched(
+            source_path, 
+            batch_size=batch_size, 
+            infer_schema_length=0, 
+            ignore_errors=True,
+            truncate_ragged_lines=True,
+            quote_char=None,
+            encoding="utf8-lossy"
+        )
+        
+        reader_tgt = pl.read_csv_batched(
+            target_path, 
+            batch_size=batch_size, 
+            infer_schema_length=0, 
+            ignore_errors=True,
+            truncate_ragged_lines=True,
+            quote_char=None,
+            encoding="utf8-lossy"
+        )
 
         total_src_rows = 0
         total_tgt_rows = 0
         all_mismatches = []
         global_mismatch_no = 1
-        MAX_MISMATCHES = 5000
 
         start_time = time.time()
         batch_count = 0
@@ -148,20 +156,20 @@ class DataComparator:
             df_src_raw = batches_src[0] if batches_src else pl.DataFrame()
             df_tgt_raw = batches_tgt[0] if batches_tgt else pl.DataFrame()
 
-            total_src_rows += df_src_raw.height
-            total_tgt_rows += df_tgt_raw.height
             batch_count += 1
 
-            # Normalize batch on-the-fly
+            # Normalize batch on-the-fly (Metadata trailer truncation applied here)
             df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config)
             df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config)
+
+            # Accumulate normalized row counts instead of raw row counts
+            total_src_rows += df_src_clean.height
+            total_tgt_rows += df_tgt_clean.height
 
             # Compare current batch
             batch_result = cls.compare_polars_dfs(df_src_clean, df_tgt_clean, config)
 
             for m in batch_result["mismatches"]:
-                if global_mismatch_no > MAX_MISMATCHES:
-                    break
                 m["no"] = global_mismatch_no
                 all_mismatches.append(m)
                 global_mismatch_no += 1
@@ -178,9 +186,6 @@ class DataComparator:
                 progress_str = f"{total_src_rows:,} rows processed"
 
             print(f"  ⏳ Batch {batch_count:02d} {progress_str} | Mismatches: {len(all_mismatches):,} | Time: {elapsed:.1f}s", flush=True)
-
-            if global_mismatch_no > MAX_MISMATCHES:
-                break
 
         status = "FAILED" if len(all_mismatches) > 0 else "PASSED"
 

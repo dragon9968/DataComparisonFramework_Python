@@ -51,24 +51,33 @@ class ExtentManager:
     @classmethod
     def _export_csv_discrepancies(cls, module_name: str, mismatches: list) -> str:
         """Export all discrepancies into a CSV file inside the output directory."""
+        if not mismatches:
+            return ""
+
         safe_module_name = re.sub(r'[\\/:*?"<>|]', '_', module_name)
         csv_filename = f"{safe_module_name}_Discrepancies.csv"
         csv_path = os.path.join(GlobalConstants.OUTPUT_PATH, csv_filename)
-        
+
         headers = ["NO.", "KEY", "COLUMN NAME", "EXPECTED (DATA)", "ACTUAL (SHARETEC)", "ISSUES"]
-        
-        with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-            for item in mismatches:
-                writer.writerow([
-                    item.get("no", ""),
-                    item.get("key", ""),
-                    item.get("column", ""),
-                    item.get("expected", ""),
-                    item.get("actual", ""),
-                    item.get("issue", "")
-                ])
+
+        try:
+            with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for item in mismatches:
+                    writer.writerow([
+                        item.get("no", ""),
+                        item.get("key", ""),
+                        item.get("column", ""),
+                        item.get("expected", ""),
+                        item.get("actual", ""),
+                        item.get("issue", "")
+                    ])
+        except PermissionError:
+            print(f"\n⚠️ WARNING: Could not update '{csv_filename}'. Please close the file if it is open in Excel.")
+        except Exception as e:
+            print(f"\n⚠️ WARNING: Failed to write CSV file '{csv_filename}': {e}")
+            
         return csv_filename
 
     @classmethod
