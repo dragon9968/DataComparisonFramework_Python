@@ -5,29 +5,8 @@ from models.module_config import ModuleConfig
 
 class ExcelReader:
 
-    @staticmethod
-    def _detect_dynamic_key_columns(columns: list) -> list:
-        key_keywords = ("type", "code", "id", "num", "number", "key")
-        exclude_keywords = ("zz-", "date", "amt", "bal", "amount", "balance", "desc")
-
-        detected = []
-        leading_cols = columns[:min(5, len(columns))]
-
-        for col in leading_cols:
-            col_lower = col.strip().lower()
-            if any(kw in col_lower for kw in exclude_keywords):
-                continue
-            if any(kw in col_lower for kw in key_keywords):
-                detected.append(col)
-
-        if detected:
-            return detected
-
-        # Fallback to composite key using first 3 columns if no key keywords found
-        return columns[:min(3, len(columns))]
-
     @classmethod
-    def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig) -> pl.DataFrame:
+    def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig, start_row_index: int = 2) -> pl.DataFrame:
         """Normalize DataFrame batch with intelligent metadata trailer truncation."""
         if df is None or df.height == 0:
             return pl.DataFrame()
@@ -64,13 +43,11 @@ class ExcelReader:
         # 2. Vectorized Column Normalization
         header_map = {col.strip().lower(): col for col in df.columns}
         actual_compare_cols = config.compare_columns if config.compare_columns else list(df.columns)
-        date_keywords = ("date", "dt", "time", "zz-", "day", "yr", "year", "mo", "month")
 
         exprs = []
         for col_name in actual_compare_cols:
             actual_col = header_map.get(col_name.lower())
             if actual_col:
-                col_lower = col_name.strip().lower()
                 expr = (
                     pl.col(actual_col)
                     .fill_null("")
@@ -81,18 +58,14 @@ class ExcelReader:
                     .str.replace(r"\.0$", "")
                     .str.replace(r"^\.(\d+)", r"0.$1")
                     .str.replace(r"^0+?([1-9]\d*|0)$", r"$1")
+                    # Universal Date Normalization applied to all columns
+                    .str.replace(r" 00:00:00$", "")
+                    .str.replace(r"T00:00:00$", "")
+                    .str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
+                    .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([3-9]\d)$", r"$1/$2/19$3")
+                    .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
+                    .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
                 )
-
-                if any(kw in col_lower for kw in date_keywords):
-                    expr = (
-                        expr
-                        .str.replace(r" 00:00:00$", "")
-                        .str.replace(r"T00:00:00$", "")
-                        .str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
-                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([3-9]\d)$", r"$1/$2/19$3")
-                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
-                        .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
-                    )
 
                 exprs.append(expr.alias(col_name))
             else:
@@ -100,23 +73,24 @@ class ExcelReader:
 
         df_clean = df.select(exprs)
 
-        # 3. Fast-Path Composite Key Resolution
+        # 3. Fast-Path Key Resolution
         key_columns_str = config.key_columns if isinstance(config.key_columns, str) else ",".join(config.key_columns or [])
         user_key_columns = [k.strip() for k in key_columns_str.split(",") if k.strip()]
 
-        if not user_key_columns:
-            effective_key_cols = cls._detect_dynamic_key_columns(list(df_clean.columns))
-        else:
-            effective_key_cols = user_key_columns
-
-        valid_keys = [k for k in effective_key_cols if k in df_clean.columns]
+        valid_keys = [k for k in user_key_columns if k in df_clean.columns]
+        
         if valid_keys:
+            # Use specified keys
             df_clean = df_clean.with_columns(
                 base_key=pl.concat_str([pl.col(k) for k in valid_keys], separator="_")
             )
         else:
+            # NO EXPLICIT KEY -> Use Excel Row Number (e.g., ROW_2, ROW_3)
             df_clean = df_clean.with_columns(
-                base_key=pl.concat_str([pl.lit("ROW_"), pl.int_range(1, pl.len() + 1).cast(pl.Utf8)])
+                base_key=pl.concat_str([
+                    pl.lit("ROW_"), 
+                    pl.int_range(start_row_index, start_row_index + pl.len()).cast(pl.Utf8)
+                ])
             )
 
         has_duplicates = df_clean["base_key"].is_duplicated().any()
@@ -165,4 +139,5 @@ class ExcelReader:
         else:
             raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
 
-        return cls.normalize_dataframe_batch(df, config)
+        # Start index is 2 because Row 1 is usually the header
+        return cls.normalize_dataframe_batch(df, config, start_row_index=2)

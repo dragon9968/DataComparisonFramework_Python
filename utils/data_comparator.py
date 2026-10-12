@@ -146,6 +146,10 @@ class DataComparator:
         start_time = time.time()
         batch_count = 0
 
+        # Row 1 is usually the header, so data starts at Row 2
+        current_offset_src = 2
+        current_offset_tgt = 2
+
         while True:
             batches_src = reader_src.next_batches(1)
             batches_tgt = reader_tgt.next_batches(1)
@@ -158,11 +162,15 @@ class DataComparator:
 
             batch_count += 1
 
-            # Normalize batch on-the-fly (Metadata trailer truncation applied here)
-            df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config)
-            df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config)
+            # Normalize batch on-the-fly and pass the exact Excel row offsets
+            df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config, start_row_index=current_offset_src)
+            df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config, start_row_index=current_offset_tgt)
 
-            # Accumulate normalized row counts instead of raw row counts
+            # Increment offsets by RAW height (to match physical lines in CSV file perfectly)
+            current_offset_src += df_src_raw.height
+            current_offset_tgt += df_tgt_raw.height
+
+            # Accumulate normalized row counts
             total_src_rows += df_src_clean.height
             total_tgt_rows += df_tgt_clean.height
 
