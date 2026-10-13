@@ -6,36 +6,44 @@ from models.module_config import ModuleConfig
 class ExcelReader:
 
     @classmethod
-    def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig, start_row_index: int = 2) -> pl.DataFrame:
+    def normalize_dataframe_batch(
+        cls, 
+        df: pl.DataFrame, 
+        config: ModuleConfig, 
+        start_row_index: int = 2,
+        is_last_batch: bool = True
+    ) -> pl.DataFrame:
         """Normalize DataFrame batch with metadata trailer truncation, field cleaning, and key generation."""
         if df is None or df.height == 0:
             return pl.DataFrame()
 
-        # 1. Truncate Progress metadata trailers (e.g., '.', 'PSC', 'filename=', 'records=', checksums)
-        first_col_raw = df.columns[0]
-        first_col_clean = (
-            df[first_col_raw]
-            .fill_null("")
-            .cast(pl.Utf8)
-            .str.replace_all(r'[\r\n\t\xa0"]', "")
-            .str.strip_chars()
-            .str.to_lowercase()
-        )
-
-        is_meta = (
-            first_col_clean.is_in([".", "psc", "0."]) |
-            first_col_clean.str.contains(
-                r"^(filename=|records=|ldbname=|timestamp=|numformat=|dateformat=|cpstream=|\.|\d{6,12}$)"
+        # 1. Truncate Progress metadata trailers ONLY on the final batch of the file
+        if is_last_batch and df.height > 0:
+            first_col_raw = df.columns[0]
+            first_col_clean = (
+                df[first_col_raw]
+                .fill_null("")
+                .cast(pl.Utf8)
+                .str.replace_all(r'[\r\n\t\xa0]', "")
+                .str.strip_chars()
+                .str.to_lowercase()
             )
-        )
 
-        tail_check_size = min(50, df.height)
-        tail_meta = is_meta.tail(tail_check_size)
-        meta_indices = tail_meta.arg_true()
+            # Strictly match metadata markers; do not match legitimate numeric identifiers
+            is_meta = (
+                first_col_clean.is_in([".", "psc"]) |
+                first_col_clean.str.contains(
+                    r"^(filename=|records=|ldbname=|timestamp=|numformat=|dateformat=|cpstream=|\.$)"
+                )
+            )
 
-        if len(meta_indices) > 0:
-            cut_offset = (df.height - tail_check_size) + meta_indices[0]
-            df = df.slice(0, cut_offset)
+            tail_check_size = min(50, df.height)
+            tail_meta = is_meta.tail(tail_check_size)
+            meta_indices = tail_meta.arg_true()
+
+            if len(meta_indices) > 0:
+                cut_offset = (df.height - tail_check_size) + meta_indices[0]
+                df = df.slice(0, cut_offset)
 
         if df.height == 0:
             return pl.DataFrame()
@@ -43,8 +51,6 @@ class ExcelReader:
         # 2. Vectorized column transformation and universal format harmonization
         header_map = {col.strip().lower(): col for col in df.columns}
         actual_compare_cols = config.compare_columns if config.compare_columns else list(df.columns)
-        
-        # Keywords to identify boolean columns to standardize True/False cases
         bool_keywords = ("log", "convert", "status", "flag", "indicator", "is-")
 
         exprs = []
@@ -56,9 +62,10 @@ class ExcelReader:
                     pl.col(actual_col)
                     .fill_null("")
                     .cast(pl.Utf8)
+                    # Clean control characters and whitespace while preserving literal quotation marks
                     .str.replace_all(r'[\r\n\t\xa0]', "")
                     .str.strip_chars()
-                    .str.replace(r"^\?$", "")  # Treat standalone '?' placeholder as empty string
+                    .str.replace(r"^\?$", "")
                     .str.replace(r"\.0$", "")
                     # Standardize leading zero for positive and negative decimals (e.g., .11 -> 0.11, -.11 -> -0.11)
                     .str.replace(r"^\.(\d+)", r"0.$1")
@@ -71,12 +78,14 @@ class ExcelReader:
                     .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([3-9]\d)$", r"$1/$2/19$3")
                     .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
                     .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
+                    # Standardize boolean casing to resolve TRUE vs true variance
+                    .str.replace(r"(?i)^true$", "TRUE")
+                    .str.replace(r"(?i)^false$", "FALSE")
                 )
-                
-                # Standardize boolean casing to resolve TRUE vs true variance
+
                 if any(kw in col_lower for kw in bool_keywords):
                     expr = expr.str.to_uppercase()
-                
+
                 exprs.append(expr.alias(col_name))
             else:
                 exprs.append(pl.lit("").alias(col_name))
@@ -88,7 +97,7 @@ class ExcelReader:
         user_key_columns = [k.strip() for k in key_columns_str.split(",") if k.strip()]
 
         valid_keys = [k for k in user_key_columns if k in df_clean.columns]
-        
+
         if valid_keys:
             df_clean = df_clean.with_columns(
                 base_key=pl.concat_str([pl.col(k) for k in valid_keys], separator="_")
@@ -136,7 +145,7 @@ class ExcelReader:
 
         if file_ext in [".csv", ".d"]:
             import pandas as pd
-            # Use Pandas Default C-engine which natively handles malformed quotes without dropping rows!
+            # Use Pandas Default C-engine which natively handles malformed quotes without dropping rows
             pdf = pd.read_csv(
                 file_path, 
                 dtype=str, 
@@ -151,4 +160,5 @@ class ExcelReader:
         else:
             raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
 
-        return cls.normalize_dataframe_batch(df, config, start_row_index=2)
+        # Start row index is 2 because row 1 contains table headers
+        return cls.normalize_dataframe_batch(df, config, start_row_index=2, is_last_batch=True)
