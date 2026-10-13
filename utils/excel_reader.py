@@ -7,11 +7,11 @@ class ExcelReader:
 
     @classmethod
     def normalize_dataframe_batch(cls, df: pl.DataFrame, config: ModuleConfig, start_row_index: int = 2) -> pl.DataFrame:
-        """Normalize DataFrame batch with intelligent metadata trailer truncation."""
+        """Normalize DataFrame batch with metadata trailer truncation, field cleaning, and key generation."""
         if df is None or df.height == 0:
             return pl.DataFrame()
 
-        # 1. Truncate Metadata Trailer (remove trailing metadata lines like ., PSC, filename=, records=, etc.)
+        # 1. Truncate Progress metadata trailers (e.g., '.', 'PSC', 'filename=', 'records=', checksums)
         first_col_raw = df.columns[0]
         first_col_clean = (
             df[first_col_raw]
@@ -40,25 +40,31 @@ class ExcelReader:
         if df.height == 0:
             return pl.DataFrame()
 
-        # 2. Vectorized Column Normalization
+        # 2. Vectorized column transformation and universal format harmonization
         header_map = {col.strip().lower(): col for col in df.columns}
         actual_compare_cols = config.compare_columns if config.compare_columns else list(df.columns)
+        
+        # Keywords to identify boolean columns to standardize True/False cases
+        bool_keywords = ("log", "convert", "status", "flag", "indicator", "is-")
 
         exprs = []
         for col_name in actual_compare_cols:
             actual_col = header_map.get(col_name.lower())
             if actual_col:
+                col_lower = col_name.strip().lower()
                 expr = (
                     pl.col(actual_col)
                     .fill_null("")
                     .cast(pl.Utf8)
-                    .str.replace_all(r'[\r\n\t\xa0"]', "")
+                    .str.replace_all(r'[\r\n\t\xa0]', "")
                     .str.strip_chars()
-                    .str.replace(r"^\?$", "")  # Convert standalone '?' to blank string
+                    .str.replace(r"^\?$", "")  # Treat standalone '?' placeholder as empty string
                     .str.replace(r"\.0$", "")
+                    # Standardize leading zero for positive and negative decimals (e.g., .11 -> 0.11, -.11 -> -0.11)
                     .str.replace(r"^\.(\d+)", r"0.$1")
+                    .str.replace(r"^-\.(\d+)", r"-0.$1")
                     .str.replace(r"^0+?([1-9]\d*|0)$", r"$1")
-                    # Universal Date Normalization applied to all columns
+                    # Universal date format standardization across all columns (MM/DD/YY -> MM/DD/YYYY)
                     .str.replace(r" 00:00:00$", "")
                     .str.replace(r"T00:00:00$", "")
                     .str.replace(r"^(\d{4})[/-]0*([1-9]\d?)[/-]0*([1-9]\d?)$", r"$2/$3/$1")
@@ -66,26 +72,29 @@ class ExcelReader:
                     .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-]([0-2]\d)$", r"$1/$2/20$3")
                     .str.replace(r"^0*([1-9]\d?)[/-]0*([1-9]\d?)[/-](\d{4})$", r"$1/$2/$3")
                 )
-
+                
+                # Standardize boolean casing to resolve TRUE vs true variance
+                if any(kw in col_lower for kw in bool_keywords):
+                    expr = expr.str.to_uppercase()
+                
                 exprs.append(expr.alias(col_name))
             else:
                 exprs.append(pl.lit("").alias(col_name))
 
         df_clean = df.select(exprs)
 
-        # 3. Fast-Path Key Resolution
+        # 3. Dynamic key resolution or fallback to Excel row number (e.g., ROW_2, ROW_3)
         key_columns_str = config.key_columns if isinstance(config.key_columns, str) else ",".join(config.key_columns or [])
         user_key_columns = [k.strip() for k in key_columns_str.split(",") if k.strip()]
 
         valid_keys = [k for k in user_key_columns if k in df_clean.columns]
         
         if valid_keys:
-            # Use specified keys
             df_clean = df_clean.with_columns(
                 base_key=pl.concat_str([pl.col(k) for k in valid_keys], separator="_")
             )
         else:
-            # NO EXPLICIT KEY -> Use Excel Row Number (e.g., ROW_2, ROW_3)
+            # Fallback directly to physical spreadsheet row indices
             df_clean = df_clean.with_columns(
                 base_key=pl.concat_str([
                     pl.lit("ROW_"), 
@@ -93,6 +102,7 @@ class ExcelReader:
                 ])
             )
 
+        # Disambiguate duplicate keys if any
         has_duplicates = df_clean["base_key"].is_duplicated().any()
 
         if not has_duplicates:
@@ -125,19 +135,20 @@ class ExcelReader:
         sheet_name = config.expected_sheet_name if is_source else config.actual_sheet_name
 
         if file_ext in [".csv", ".d"]:
-            df = pl.read_csv(
+            import pandas as pd
+            # Use Pandas Default C-engine which natively handles malformed quotes without dropping rows!
+            pdf = pd.read_csv(
                 file_path, 
-                infer_schema_length=0, 
-                ignore_errors=True, 
-                truncate_ragged_lines=True,
-                quote_char=None,
-                encoding="utf8-lossy"
+                dtype=str, 
+                encoding="utf-8", 
+                encoding_errors="replace",
+                keep_default_na=False
             )
+            df = pl.from_pandas(pdf)
         elif file_ext in [".xlsx", ".xlsm", ".xls"]:
             df = pl.read_excel(file_path, sheet_name=sheet_name) if sheet_name else pl.read_excel(file_path)
             df = df.select([pl.all().cast(pl.Utf8)])
         else:
             raise ValueError(f"❌ Unsupported format '{file_ext}' for file: {file_path}")
 
-        # Start index is 2 because Row 1 is usually the header
         return cls.normalize_dataframe_batch(df, config, start_row_index=2)

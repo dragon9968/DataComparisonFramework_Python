@@ -48,7 +48,7 @@ class TestBulkCompare:
 
         config = ModuleConfig(
             moduleName=module_name,
-            keyColumns="", 
+            keyColumns="", # Enter the column names to be used as the unique identifier (separated by commas)
             compareColumns=[]
         )
 

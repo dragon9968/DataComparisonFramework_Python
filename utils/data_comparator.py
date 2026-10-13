@@ -9,7 +9,7 @@ class DataComparator:
 
     @staticmethod
     def _count_total_lines_fast(file_path: str) -> int:
-        """Ultra-fast raw binary line count for progress calculation without loading memory."""
+        """Count total lines rapidly via raw binary chunks without loading dataset into RAM."""
         try:
             with open(file_path, "rb") as f:
                 return sum(buffer.count(b"\n") for buffer in iter(lambda: f.read(8 * 1024 * 1024), b""))
@@ -18,7 +18,7 @@ class DataComparator:
 
     @classmethod
     def compare_polars_dfs(cls, df_source: pl.DataFrame, df_target: pl.DataFrame, config: ModuleConfig) -> dict:
-        """Vectorized reconciliation comparator for standard DataFrames."""
+        """Vectorized reconciliation comparator for standard in-memory DataFrames."""
         total_source_rows = df_source.height if df_source is not None else 0
         total_target_rows = df_target.height if df_target is not None else 0
 
@@ -42,7 +42,7 @@ class DataComparator:
         mismatches = []
         mismatch_no = 1
 
-        # Missing Records in Target
+        # Check for missing records in target
         missing_in_target = joined.filter(pl.col("final_key_target").is_null())
         if missing_in_target.height > 0:
             keys = missing_in_target.get_column("final_key").to_list()
@@ -57,7 +57,7 @@ class DataComparator:
                 })
                 mismatch_no += 1
 
-        # Missing Records in Source
+        # Check for missing records in source
         missing_in_source = joined.filter(pl.col("final_key").is_null())
         if missing_in_source.height > 0:
             keys = missing_in_source.get_column("final_key_target").to_list()
@@ -72,7 +72,7 @@ class DataComparator:
                 })
                 mismatch_no += 1
 
-        # Series-level Column Comparison for Matched Keys
+        # Vectorized column-by-column variance check for matched keys
         matched = joined.filter(pl.col("final_key").is_not_null() & pl.col("final_key_target").is_not_null())
 
         if matched.height > 0:
@@ -114,28 +114,20 @@ class DataComparator:
 
     @classmethod
     def compare_large_files_batched(cls, source_path: str, target_path: str, config: ModuleConfig, batch_size: int = 150000) -> dict:
-        """In-memory streaming comparator with real-time console line-by-line logging."""
+        """Stream and reconcile large CSV dumps in-memory using robust Pandas chunking."""
+        import pandas as pd
         print(f"\n🚀 [LARGE FILE MODE] Counting total rows in file for progress tracking...", flush=True)
         total_source_lines = cls._count_total_lines_fast(source_path)
         
-        reader_src = pl.read_csv_batched(
-            source_path, 
-            batch_size=batch_size, 
-            infer_schema_length=0, 
-            ignore_errors=True,
-            truncate_ragged_lines=True,
-            quote_char=None,
-            encoding="utf8-lossy"
+        # Use pandas chunksize to safely read malformed CSV lines without shifting columns.
+        # keep_default_na=False ensures empty fields become "" instead of NaN.
+        reader_src = pd.read_csv(
+            source_path, chunksize=batch_size, dtype=str, 
+            encoding="utf-8", encoding_errors="replace", keep_default_na=False
         )
-        
-        reader_tgt = pl.read_csv_batched(
-            target_path, 
-            batch_size=batch_size, 
-            infer_schema_length=0, 
-            ignore_errors=True,
-            truncate_ragged_lines=True,
-            quote_char=None,
-            encoding="utf8-lossy"
+        reader_tgt = pd.read_csv(
+            target_path, chunksize=batch_size, dtype=str, 
+            encoding="utf-8", encoding_errors="replace", keep_default_na=False
         )
 
         total_src_rows = 0
@@ -146,54 +138,45 @@ class DataComparator:
         start_time = time.time()
         batch_count = 0
 
-        # Row 1 is usually the header, so data starts at Row 2
         current_offset_src = 2
         current_offset_tgt = 2
 
-        while True:
-            batches_src = reader_src.next_batches(1)
-            batches_tgt = reader_tgt.next_batches(1)
+        try:
+            for pdf_src, pdf_tgt in zip(reader_src, reader_tgt):
+                batch_count += 1
 
-            if not batches_src and not batches_tgt:
-                break
+                df_src_raw = pl.from_pandas(pdf_src)
+                df_tgt_raw = pl.from_pandas(pdf_tgt)
 
-            df_src_raw = batches_src[0] if batches_src else pl.DataFrame()
-            df_tgt_raw = batches_tgt[0] if batches_tgt else pl.DataFrame()
+                df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config, start_row_index=current_offset_src)
+                df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config, start_row_index=current_offset_tgt)
 
-            batch_count += 1
+                current_offset_src += df_src_raw.height
+                current_offset_tgt += df_tgt_raw.height
 
-            # Normalize batch on-the-fly and pass the exact Excel row offsets
-            df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config, start_row_index=current_offset_src)
-            df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config, start_row_index=current_offset_tgt)
+                total_src_rows += df_src_clean.height
+                total_tgt_rows += df_tgt_clean.height
 
-            # Increment offsets by RAW height (to match physical lines in CSV file perfectly)
-            current_offset_src += df_src_raw.height
-            current_offset_tgt += df_tgt_raw.height
+                batch_result = cls.compare_polars_dfs(df_src_clean, df_tgt_clean, config)
 
-            # Accumulate normalized row counts
-            total_src_rows += df_src_clean.height
-            total_tgt_rows += df_tgt_clean.height
+                for m in batch_result["mismatches"]:
+                    m["no"] = global_mismatch_no
+                    all_mismatches.append(m)
+                    global_mismatch_no += 1
 
-            # Compare current batch
-            batch_result = cls.compare_polars_dfs(df_src_clean, df_tgt_clean, config)
+                elapsed = time.time() - start_time
+                if total_source_lines > 0:
+                    pct = min(100.0, (total_src_rows / total_source_lines) * 100)
+                    bar_len = 15
+                    filled = int(bar_len * pct // 100)
+                    bar = "=" * filled + "-" * (bar_len - filled)
+                    progress_str = f"[{bar}] {pct:.1f}% | {total_src_rows:,}/{total_source_lines:,} rows"
+                else:
+                    progress_str = f"{total_src_rows:,} rows processed"
 
-            for m in batch_result["mismatches"]:
-                m["no"] = global_mismatch_no
-                all_mismatches.append(m)
-                global_mismatch_no += 1
-
-            # Real-time Explicit Print Log
-            elapsed = time.time() - start_time
-            if total_source_lines > 0:
-                pct = min(100.0, (total_src_rows / total_source_lines) * 100)
-                bar_len = 15
-                filled = int(bar_len * pct // 100)
-                bar = "=" * filled + "-" * (bar_len - filled)
-                progress_str = f"[{bar}] {pct:.1f}% | {total_src_rows:,}/{total_source_lines:,} rows"
-            else:
-                progress_str = f"{total_src_rows:,} rows processed"
-
-            print(f"  ⏳ Batch {batch_count:02d} {progress_str} | Mismatches: {len(all_mismatches):,} | Time: {elapsed:.1f}s", flush=True)
+                print(f"  ⏳ Batch {batch_count:02d} {progress_str} | Mismatches: {len(all_mismatches):,} | Time: {elapsed:.1f}s", flush=True)
+        except StopIteration:
+            pass
 
         status = "FAILED" if len(all_mismatches) > 0 else "PASSED"
 
