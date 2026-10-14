@@ -148,8 +148,22 @@ class DataComparator:
                 df_src_raw = pl.from_pandas(pdf_src)
                 df_tgt_raw = pl.from_pandas(pdf_tgt)
 
-                df_src_clean = ExcelReader.normalize_dataframe_batch(df_src_raw, config, start_row_index=current_offset_src)
-                df_tgt_clean = ExcelReader.normalize_dataframe_batch(df_tgt_raw, config, start_row_index=current_offset_tgt)
+                # Check if this is the final batch
+                is_last_src = df_src_raw.height < batch_size
+                is_last_tgt = df_tgt_raw.height < batch_size
+
+                df_src_clean = ExcelReader.normalize_dataframe_batch(
+                    df_src_raw, 
+                    config, 
+                    start_row_index=current_offset_src,
+                    is_last_batch=is_last_src
+                )
+                df_tgt_clean = ExcelReader.normalize_dataframe_batch(
+                    df_tgt_raw, 
+                    config, 
+                    start_row_index=current_offset_tgt,
+                    is_last_batch=is_last_tgt
+                )
 
                 current_offset_src += df_src_raw.height
                 current_offset_tgt += df_tgt_raw.height
