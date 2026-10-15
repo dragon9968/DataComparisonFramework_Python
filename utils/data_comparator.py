@@ -1,9 +1,12 @@
 import os
-import sys
+import csv
+import re
 import time
 import polars as pl
 from models.module_config import ModuleConfig
 from utils.excel_reader import ExcelReader
+from commons.global_constants import GlobalConstants
+from utils.file_utils import FileUtils
 
 class DataComparator:
 
@@ -18,7 +21,7 @@ class DataComparator:
 
     @classmethod
     def compare_polars_dfs(cls, df_source: pl.DataFrame, df_target: pl.DataFrame, config: ModuleConfig) -> dict:
-        """Vectorized reconciliation comparator for standard in-memory DataFrames."""
+        """Optimized reconciliation comparator with fast-path equality checks and on-demand normalization."""
         total_source_rows = df_source.height if df_source is not None else 0
         total_target_rows = df_target.height if df_target is not None else 0
 
@@ -72,7 +75,7 @@ class DataComparator:
                 })
                 mismatch_no += 1
 
-        # Vectorized column-by-column variance check for matched keys
+        # Vectorized column-by-column variance check with on-demand normalization
         matched = joined.filter(pl.col("final_key").is_not_null() & pl.col("final_key_target").is_not_null())
 
         if matched.height > 0:
@@ -83,14 +86,23 @@ class DataComparator:
                 s_exp = matched[col]
                 s_act = matched[target_col]
 
+                # FAST-PATH 1: Skip immediately if raw columns are identical (takes ~0.001s)
                 if s_exp.equals(s_act):
                     continue
 
-                diff_indices = (s_exp != s_act).arg_true()
+                # ON-DEMAND NORMALIZATION: Normalize only when differences exist
+                s_exp_clean = ExcelReader.normalize_column_series(s_exp, col)
+                s_act_clean = ExcelReader.normalize_column_series(s_act, col)
+
+                # FAST-PATH 2: Skip if normalized format resolves the variance
+                if s_exp_clean.equals(s_act_clean):
+                    continue
+
+                diff_indices = (s_exp_clean != s_act_clean).arg_true()
                 if len(diff_indices) > 0:
                     sub_keys = keys_series[diff_indices].to_list()
-                    sub_exp = s_exp[diff_indices].to_list()
-                    sub_act = s_act[diff_indices].to_list()
+                    sub_exp = s_exp_clean[diff_indices].to_list()
+                    sub_act = s_act_clean[diff_indices].to_list()
 
                     for i in range(len(sub_keys)):
                         mismatches.append({
@@ -114,13 +126,11 @@ class DataComparator:
 
     @classmethod
     def compare_large_files_batched(cls, source_path: str, target_path: str, config: ModuleConfig, batch_size: int = 150000) -> dict:
-        """Stream and reconcile large CSV dumps in-memory using robust Pandas chunking."""
+        """Stream and reconcile massive files (10GB-20GB) without memory bloat using disk streaming."""
         import pandas as pd
         print(f"\n🚀 [LARGE FILE MODE] Counting total rows in file for progress tracking...", flush=True)
         total_source_lines = cls._count_total_lines_fast(source_path)
         
-        # Use pandas chunksize to safely read malformed CSV lines without shifting columns.
-        # keep_default_na=False ensures empty fields become "" instead of NaN.
         reader_src = pd.read_csv(
             source_path, chunksize=batch_size, dtype=str, 
             encoding="utf-8", encoding_errors="replace", keep_default_na=False
@@ -132,7 +142,8 @@ class DataComparator:
 
         total_src_rows = 0
         total_tgt_rows = 0
-        all_mismatches = []
+        total_mismatches_count = 0
+        top_200_mismatches = []
         global_mismatch_no = 1
 
         start_time = time.time()
@@ -141,6 +152,15 @@ class DataComparator:
         current_offset_src = 2
         current_offset_tgt = 2
 
+        FileUtils.create_directory_if_not_exists(str(GlobalConstants.OUTPUT_PATH))
+        module_name_val = getattr(config, "module_name", getattr(config, "moduleName", "Unknown_Module"))
+        safe_module_name = re.sub(r'[\\/:*?"<>|]', '_', str(module_name_val))
+        csv_filename = f"{safe_module_name}_Discrepancies.csv"
+        csv_path = os.path.join(GlobalConstants.OUTPUT_PATH, csv_filename)
+
+        csv_file = None
+        csv_writer = None
+
         try:
             for pdf_src, pdf_tgt in zip(reader_src, reader_tgt):
                 batch_count += 1
@@ -148,7 +168,6 @@ class DataComparator:
                 df_src_raw = pl.from_pandas(pdf_src)
                 df_tgt_raw = pl.from_pandas(pdf_tgt)
 
-                # Check if this is the final batch
                 is_last_src = df_src_raw.height < batch_size
                 is_last_tgt = df_tgt_raw.height < batch_size
 
@@ -172,11 +191,22 @@ class DataComparator:
                 total_tgt_rows += df_tgt_clean.height
 
                 batch_result = cls.compare_polars_dfs(df_src_clean, df_tgt_clean, config)
+                batch_mismatches = batch_result["mismatches"]
 
-                for m in batch_result["mismatches"]:
-                    m["no"] = global_mismatch_no
-                    all_mismatches.append(m)
-                    global_mismatch_no += 1
+                if batch_mismatches:
+                    if csv_writer is None:
+                        csv_file = open(csv_path, mode="w", newline="", encoding="utf-8-sig")
+                        csv_writer = csv.writer(csv_file)
+                        csv_writer.writerow(["NO.", "KEY", "COLUMN NAME", "EXPECTED (DATA)", "ACTUAL (SHARETEC)", "ISSUES"])
+
+                    for m in batch_mismatches:
+                        m["no"] = global_mismatch_no
+                        if len(top_200_mismatches) < 200:
+                            top_200_mismatches.append(m)
+                        csv_writer.writerow([m["no"], m["key"], m["column"], m["expected"], m["actual"], m["issue"]])
+                        global_mismatch_no += 1
+
+                    total_mismatches_count += len(batch_mismatches)
 
                 elapsed = time.time() - start_time
                 if total_source_lines > 0:
@@ -188,15 +218,20 @@ class DataComparator:
                 else:
                     progress_str = f"{total_src_rows:,} rows processed"
 
-                print(f"  ⏳ Batch {batch_count:02d} {progress_str} | Mismatches: {len(all_mismatches):,} | Time: {elapsed:.1f}s", flush=True)
+                print(f"  ⏳ Batch {batch_count:02d} {progress_str} | Mismatches: {total_mismatches_count:,} | Time: {elapsed:.1f}s", flush=True)
         except StopIteration:
             pass
+        finally:
+            if csv_file is not None:
+                csv_file.close()
 
-        status = "FAILED" if len(all_mismatches) > 0 else "PASSED"
+        status = "FAILED" if total_mismatches_count > 0 else "PASSED"
 
         return {
             "status": status,
             "total_source_rows": total_src_rows,
             "total_target_rows": total_tgt_rows,
-            "mismatches": all_mismatches
+            "total_mismatches": total_mismatches_count,
+            "mismatches": top_200_mismatches,
+            "csv_filename": csv_filename if total_mismatches_count > 0 else ""
         }

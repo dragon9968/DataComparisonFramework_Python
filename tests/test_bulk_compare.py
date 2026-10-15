@@ -42,15 +42,24 @@ class TestBulkCompare:
                     "expected": "FILE AVAILABLE",
                     "actual": f"NOT FOUND AT {target_path}",
                     "issue": "MISSING_TARGET_FILE"
-                }]
+                }],
+                total_mismatches=1,
+                csv_filename=""
             )
             pytest.fail(f"❌ Target file not found at {target_path}")
 
-        config = ModuleConfig(
-            moduleName=module_name,
-            keyColumns="", # Enter the column names to be used as the unique identifier (separated by commas)
-            compareColumns=[]
-        )
+        try:
+            config = ModuleConfig(
+                module_name=module_name,
+                key_columns="", 
+                compare_columns=[]
+            )
+        except TypeError:
+            config = ModuleConfig(
+                moduleName=module_name,
+                keyColumns="", 
+                compareColumns=[]
+            )
 
         file_size_mb = os.path.getsize(source_path) / (1024 * 1024)
 
@@ -62,14 +71,16 @@ class TestBulkCompare:
             df_target = ExcelReader.read_file_to_polars_df(target_path, config, is_source=False)
             result = DataComparator.compare_polars_dfs(df_source, df_target, config)
 
-        total_discrepancies = len(result["mismatches"])
+        total_discrepancies = result.get("total_mismatches", len(result["mismatches"]))
 
         ExtentManager.add_result(
             module_name=module_name,
             status=result["status"],
             total_exp=result["total_source_rows"],
             total_act=result["total_target_rows"],
-            mismatches=result["mismatches"]
+            mismatches=result["mismatches"],
+            total_mismatches=total_discrepancies,
+            csv_filename=result.get("csv_filename", "")
         )
 
         if result["status"] == "FAILED":

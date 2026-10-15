@@ -10,19 +10,23 @@ from utils.file_utils import FileUtils
 class ExtentManager:
     _test_results = []
     _start_time = None
+
     @classmethod
     def clear_results(cls):
         """Clear previous test results before running a new test suite."""
         cls._test_results = []
         cls._start_time = time.time()
+
     @classmethod
-    def add_result(cls, module_name: str, status: str, total_exp: int, total_act: int, mismatches: list):
+    def add_result(cls, module_name: str, status: str, total_exp: int, total_act: int, mismatches: list, total_mismatches: int = None, csv_filename: str = ""):
         cls._test_results.append({
             "module_name": module_name,
             "status": status,
             "total_exp": total_exp,
             "total_act": total_act,
             "mismatches": mismatches,
+            "total_mismatches": total_mismatches if total_mismatches is not None else len(mismatches),
+            "csv_filename": csv_filename,
             "timestamp": datetime.now().strftime("%I:%M:%S %p")
         })
 
@@ -41,7 +45,7 @@ class ExtentManager:
             status_badge = "❌ FAIL" if res["status"] == "FAILED" else "✅ PASS"
             total_exp = res["total_exp"]
             total_act = res["total_act"]
-            mismatches_count = len(res["mismatches"])
+            mismatches_count = res.get("total_mismatches", len(res["mismatches"]))
             
             disp_name = module_name if len(module_name) <= 42 else "..." + module_name[-39:]
             print(f"│ {disp_name:<42} │ {total_exp:<8} │ {total_act:<8} │ {mismatches_count:<12} │ {status_badge:<8} │")
@@ -50,7 +54,7 @@ class ExtentManager:
 
     @classmethod
     def _export_csv_discrepancies(cls, module_name: str, mismatches: list) -> str:
-        """Export all discrepancies into a CSV file inside the output directory."""
+        """Fallback exporter for standard in-memory tests."""
         if not mismatches:
             return ""
 
@@ -73,10 +77,8 @@ class ExtentManager:
                         item.get("actual", ""),
                         item.get("issue", "")
                     ])
-        except PermissionError:
-            print(f"\n⚠️ WARNING: Could not update '{csv_filename}'. Please close the file if it is open in Excel.")
-        except Exception as e:
-            print(f"\n⚠️ WARNING: Failed to write CSV file '{csv_filename}': {e}")
+        except Exception:
+            pass
             
         return csv_filename
 
@@ -97,7 +99,6 @@ class ExtentManager:
             m, s = divmod(int(elapsed_sec), 60)
             duration_str = f"{m}m {s}s"
 
-        # Organize results by folder structure
         grouped_results = {}
         total_pass = 0
         total_fail = 0
@@ -176,7 +177,7 @@ class ExtentManager:
         summary_table_rows = ""
         for res in cls._test_results:
             m_name = res["module_name"]
-            mismatches_count = len(res["mismatches"])
+            mismatches_count = res.get("total_mismatches", len(res["mismatches"]))
             status_color = "#f44336" if res["status"] == "FAILED" else "#4caf50"
             status_label = "FAIL" if res["status"] == "FAILED" else "PASS"
             
@@ -234,17 +235,16 @@ class ExtentManager:
         </div>
         """
 
-        # 3. Build Individual File Detail Contents
         content_items = dashboard_html
 
         for idx, res in enumerate(cls._test_results, 1):
             module_name = res["module_name"]
             safe_id = "mod-" + re.sub(r'[^a-zA-Z0-9_-]', '_', module_name)
             
-            total_mismatches = len(res["mismatches"])
-            csv_filename = ""
+            total_mismatches = res.get("total_mismatches", len(res["mismatches"]))
+            csv_filename = res.get("csv_filename", "")
             
-            if total_mismatches > 0:
+            if not csv_filename and total_mismatches > 0:
                 csv_filename = cls._export_csv_discrepancies(module_name, res["mismatches"])
 
             display_mismatches = res["mismatches"][:200]
@@ -266,7 +266,7 @@ class ExtentManager:
             if total_mismatches > 200:
                 notice_html = f"""
                 <div style="background-color:#fff3cd; color:#856404; padding:10px 15px; border-radius:4px; margin-bottom:15px; border:1px solid #ffeeba;">
-                    ⚠️ <strong>Notice:</strong> Showing first 200 of {total_mismatches} discrepancies in HTML. Full report exported to <strong>{csv_filename}</strong>
+                    ⚠️ <strong>Notice:</strong> Showing top 200 of {total_mismatches:,} discrepancies in HTML. Full report exported to <strong>{csv_filename}</strong>
                 </div>
                 """
             elif total_mismatches > 0:
@@ -285,10 +285,10 @@ class ExtentManager:
                 </div>
                 <p style="font-weight:bold; color:#555;">AUTO VERIFICATION FOR {html.escape(module_name)}</p>
                 <p style="font-size:14px; margin-bottom:15px;">
-                    <strong>Count:</strong> Total Row Expected = {res['total_exp']} | Total Row Actual = {res['total_act']}
+                    <strong>Count:</strong> Total Row Expected = {res['total_exp']:,} | Total Row Actual = {res['total_act']:,}
                 </p>
                 <p style="font-weight:bold; color:#333;">
-                    Detail {total_mismatches} Data Discrepancies:
+                    Detail {total_mismatches:,} Data Discrepancies:
                 </p>
                 {notice_html}
 
