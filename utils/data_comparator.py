@@ -288,7 +288,10 @@ class DataComparator:
 
                 elapsed = time.time() - start_time
                 if total_source_lines > 0:
-                    pct = min(100.0, (total_src_rows / total_source_lines) * 100)
+                    if is_last_src:
+                        pct = 100.0
+                    else:
+                        pct = min(99.9, (total_src_rows / total_source_lines) * 100)
                     bar_len = 15
                     filled = int(bar_len * pct // 100)
                     bar = "=" * filled + "-" * (bar_len - filled)

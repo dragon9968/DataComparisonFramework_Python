@@ -10,16 +10,19 @@ SOURCE_DIR = os.path.join(GlobalConstants.PROJECT_PATH, "resources", "raw_data")
 TARGET_DIR = os.path.join(GlobalConstants.PROJECT_PATH, "resources", "sharetec_data")
 
 def get_all_bulk_files():
-    if not os.path.exists(SOURCE_DIR):
-        return []
+    """Scan and merge file paths across both raw_data and sharetec_data directories."""
+    all_files = set()
+    supported_extensions = (".csv", ".xlsx", ".xls", ".xlsm", ".d")
 
-    file_list = []
-    for root, _, files in os.walk(SOURCE_DIR):
-        for file in files:
-            if file.lower().endswith((".csv", ".xlsx", ".xls", ".xlsm", ".d")):
-                rel_path = os.path.relpath(os.path.join(root, file), SOURCE_DIR)
-                file_list.append(rel_path)
-    return file_list
+    for base_dir in [SOURCE_DIR, TARGET_DIR]:
+        if os.path.exists(base_dir):
+            for root, _, files in os.walk(base_dir):
+                for file in files:
+                    if file.lower().endswith(supported_extensions):
+                        rel_path = os.path.relpath(os.path.join(root, file), base_dir)
+                        all_files.add(rel_path)
+
+    return sorted(list(all_files))
 
 class TestBulkCompare:
 
@@ -29,6 +32,27 @@ class TestBulkCompare:
         target_path = os.path.join(TARGET_DIR, rel_file_path)
         module_name = rel_file_path.replace("\\", "/")
 
+        # 1. Check if file exists in sharetec_data but is missing in raw_data
+        if not os.path.exists(source_path):
+            ExtentManager.add_result(
+                module_name=module_name,
+                status="FAILED",
+                total_exp=0,
+                total_act=0,
+                mismatches=[{
+                    "no": 1,
+                    "key": "SYSTEM",
+                    "column": "FILE_EXISTENCE",
+                    "expected": f"NOT FOUND AT {source_path}",
+                    "actual": "FILE AVAILABLE IN SHARETEC",
+                    "issue": "MISSING_SOURCE_FILE"
+                }],
+                total_mismatches=1,
+                csv_filename=""
+            )
+            pytest.fail(f"❌ Source file not found in raw_data: {source_path}")
+
+        # 2. Check if file exists in raw_data but is missing in sharetec_data
         if not os.path.exists(target_path):
             ExtentManager.add_result(
                 module_name=module_name,
@@ -39,14 +63,14 @@ class TestBulkCompare:
                     "no": 1,
                     "key": "SYSTEM",
                     "column": "FILE_EXISTENCE",
-                    "expected": "FILE AVAILABLE",
+                    "expected": "FILE AVAILABLE IN RAW DATA",
                     "actual": f"NOT FOUND AT {target_path}",
                     "issue": "MISSING_TARGET_FILE"
                 }],
                 total_mismatches=1,
                 csv_filename=""
             )
-            pytest.fail(f"❌ Target file not found at {target_path}")
+            pytest.fail(f"❌ Target file not found in sharetec_data: {target_path}")
 
         try:
             config = ModuleConfig(
@@ -83,11 +107,9 @@ class TestBulkCompare:
             if user_key_columns:
                 detected_keys = user_key_columns
             else:
-                # If row counts are identical, keep physical row order (ROW_2, ROW_3...)
                 if df_src_truncated.height == df_tgt_truncated.height:
                     use_row_key = True
                 else:
-                    # When row counts differ, auto discover business key to prevent cascading misalignment
                     detected_keys = ExcelReader.auto_detect_key_columns(df_src_truncated)
 
             df_source = ExcelReader.normalize_dataframe_batch(
